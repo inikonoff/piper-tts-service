@@ -11,7 +11,7 @@ from typing import Optional, AsyncGenerator, List
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 import wave
@@ -77,6 +77,8 @@ async def lifespan(app: FastAPI):
             logger.info(f"   - Thread pool size: {executor._max_workers}")
         else:
             logger.warning("⚠️ Piper model not found or library not installed")
+            if not Path(MODEL_PATH).exists():
+                logger.error(f"❌ Model file not found at: {MODEL_PATH}")
     except Exception as e:
         logger.error(f"❌ Failed to load Piper model: {e}")
     
@@ -113,22 +115,13 @@ class TTSRequest(BaseModel):
 # HEALTH CHECK ENDPOINTS
 # =============================================================================
 
-@app.get("/")
-async def root():
-    """Health check endpoint для UptimeRobot"""
-    return {
-        "service": "Piper TTS Service (Optimized)",
-        "status": "healthy" if voice_model else "model_not_loaded",
-        "version": "2.0.0",
-        "features": ["parallel_streaming", "thread_pool", "medium_quality"],
-        "thread_pool_size": executor._max_workers,
-        "timestamp": datetime.utcnow().isoformat()
-    }
-
-
+@app.head("/health")
 @app.get("/health")
-async def health_check():
-    """Детальный health check для мониторинга"""
+async def health_check(request: Request = None):
+    """Детальный health check для мониторинга (поддерживает GET и HEAD)"""
+    if request and request.method == "HEAD":
+        return Response(status_code=200 if voice_model else 503)
+    
     return {
         "status": "healthy" if voice_model else "unhealthy",
         "model": {
@@ -141,6 +134,19 @@ async def health_check():
             "max_workers": executor._max_workers,
             "active": len(executor._threads)
         },
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@app.get("/")
+async def root():
+    """Health check endpoint для UptimeRobot"""
+    return {
+        "service": "Piper TTS Service (Optimized)",
+        "status": "healthy" if voice_model else "model_not_loaded",
+        "version": "2.0.0",
+        "features": ["parallel_streaming", "thread_pool", "medium_quality"],
+        "thread_pool_size": executor._max_workers,
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -193,9 +199,34 @@ def synthesize_sentence(sentence: str) -> Optional[bytes]:
         bytes: Аудио в формате WAV или None в случае ошибки
     """
     try:
+        if not voice_model:
+            logger.error("❌ Voice model not loaded")
+            return None
+            
+        if not sentence or not sentence.strip():
+            logger.warning("⚠️ Empty sentence provided")
+            return None
+        
+        # Создаем BytesIO для аудио данных
         audio_buffer = io.BytesIO()
-        voice_model.synthesize(sentence, audio_buffer)
-        return audio_buffer.getvalue()
+        
+        # Открываем его как WAV файл через wave
+        with wave.open(audio_buffer, 'wb') as wav_file:
+            # Синтезируем речь прямо в WAV файл
+            voice_model.synthesize(sentence, wav_file)
+        
+        # Получаем байты и проверяем размер
+        audio_buffer.seek(0)
+        audio_data = audio_buffer.read()
+        
+        # WAV файл с заголовком минимум 44 байта + данные
+        if len(audio_data) < 44:
+            logger.warning(f"⚠️ Generated audio too small: {len(audio_data)} bytes")
+            return None
+            
+        logger.debug(f"✅ Generated {len(audio_data)} bytes for: {sentence[:30]}...")
+        return audio_data
+        
     except Exception as e:
         logger.error(f"❌ Error synthesizing sentence '{sentence[:50]}...': {e}")
         return None
@@ -241,26 +272,44 @@ async def stream_audio_chunks(sentences: List[str]) -> AsyncGenerator[bytes, Non
         bytes: Аудио чанки в формате WAV
     """
     if not sentences:
+        logger.warning("No sentences to process")
         return
     
-    logger.info(f"🚀 Starting parallel streaming for {len(sentences)} sentences")
+    # Фильтруем пустые предложения
+    valid_sentences = [s for s in sentences if s and s.strip()]
+    
+    if not valid_sentences:
+        logger.warning("No valid sentences after filtering")
+        return
+    
+    logger.info(f"🚀 Starting parallel streaming for {len(valid_sentences)} sentences")
     
     # Создаем задачи для всех предложений
-    tasks = [generate_sentence_chunk(sentence) for sentence in sentences if sentence.strip()]
+    tasks = [generate_sentence_chunk(sentence) for sentence in valid_sentences]
     
     if not tasks:
+        logger.warning("No tasks created")
         return
     
     # Используем asyncio.as_completed для получения результатов по мере готовности
     completed = 0
-    for task in asyncio.as_completed(tasks):
-        chunk = await task
-        if chunk:
-            completed += 1
-            logger.debug(f"📦 Sending chunk {completed}/{len(tasks)}: {len(chunk)} bytes")
-            yield chunk
+    failed = 0
     
-    logger.info(f"✅ Streaming completed: {completed}/{len(tasks)} chunks sent")
+    for i, task in enumerate(asyncio.as_completed(tasks)):
+        try:
+            chunk = await task
+            if chunk and len(chunk) > 44:  # WAV заголовок минимум 44 байта
+                completed += 1
+                logger.info(f"📦 Sending chunk {completed}/{len(tasks)}: {len(chunk)} bytes")
+                yield chunk
+            else:
+                failed += 1
+                logger.warning(f"⚠️ Empty or invalid chunk received ({len(chunk) if chunk else 0} bytes)")
+        except Exception as e:
+            failed += 1
+            logger.error(f"❌ Error processing chunk {i}: {e}")
+    
+    logger.info(f"✅ Streaming completed: {completed} sent, {failed} failed, total {len(tasks)}")
 
 
 @app.post("/tts/stream")
@@ -271,6 +320,7 @@ async def text_to_speech_stream(request: TTSRequest):
     Предложения генерируются параллельно в пуле потоков.
     """
     if not voice_model:
+        logger.error("❌ TTS model not loaded")
         raise HTTPException(status_code=503, detail="TTS model not loaded")
     
     try:
@@ -278,9 +328,11 @@ async def text_to_speech_stream(request: TTSRequest):
         sentences = split_into_sentences(request.text)
         
         if not sentences:
+            logger.warning("No sentences extracted from text")
             raise HTTPException(status_code=400, detail="No text to synthesize")
         
         logger.info(f"📝 Processing {len(sentences)} sentences with parallel streaming")
+        logger.debug(f"Text: {request.text[:100]}...")
         
         # Создаем streaming response
         return StreamingResponse(
@@ -309,24 +361,30 @@ async def text_to_speech(request: TTSRequest):
     Сохранен для обратной совместимости, но тоже использует параллельную генерацию.
     """
     if not voice_model:
+        logger.error("❌ TTS model not loaded")
         raise HTTPException(status_code=503, detail="TTS model not loaded")
     
     try:
         sentences = split_into_sentences(request.text)
         
         if not sentences:
+            logger.warning("No sentences extracted from text")
             raise HTTPException(status_code=400, detail="No text to synthesize")
         
         logger.info(f"📝 Generating full audio for {len(sentences)} sentences in parallel")
         
+        # Фильтруем пустые предложения
+        valid_sentences = [s for s in sentences if s and s.strip()]
+        
         # Генерируем все чанки параллельно
-        tasks = [generate_sentence_chunk(sentence) for sentence in sentences if sentence.strip()]
+        tasks = [generate_sentence_chunk(sentence) for sentence in valid_sentences]
         chunks = await asyncio.gather(*tasks)
         
-        # Фильтруем None и объединяем
-        valid_chunks = [chunk for chunk in chunks if chunk]
+        # Фильтруем None и пустые чанки
+        valid_chunks = [chunk for chunk in chunks if chunk and len(chunk) > 44]
         
         if not valid_chunks:
+            logger.error("No valid audio chunks generated")
             raise HTTPException(status_code=500, detail="No audio generated")
         
         # Объединяем все чанки в один WAV файл
@@ -359,9 +417,12 @@ def split_into_sentences(text: str) -> List[str]:
     Улучшенное разбиение текста на предложения.
     Учитывает сокращения (Mr., Dr., etc.) и не разбивает по ним.
     """
+    if not text:
+        return []
+    
     # Более точное разбиение с учетом распространенных сокращений
     # Сначала защищаем точки в сокращениях
-    abbreviations = ['Mr', 'Mrs', 'Dr', 'Prof', 'Sr', 'Jr', 'vs', 'etc', 'e.g', 'i.e']
+    abbreviations = ['Mr', 'Mrs', 'Dr', 'Prof', 'Sr', 'Jr', 'vs', 'etc', 'e.g', 'i.e', 'Ms', 'Ph.D']
     protected_text = text
     
     for i, abbr in enumerate(abbreviations):
@@ -377,6 +438,7 @@ def split_into_sentences(text: str) -> List[str]:
             sentence = sentence.replace(f'__ABBR{i}__', f'{abbr}.')
         result.append(sentence.strip())
     
+    # Фильтруем пустые
     return [s for s in result if s]
 
 
@@ -425,6 +487,7 @@ def combine_wav_chunks(chunks: List[bytes]) -> bytes:
                         logger.warning(f"Error processing chunk {i}: {e}")
                         continue
             
+            output.seek(0)
             return output.getvalue()
             
     except Exception as e:
