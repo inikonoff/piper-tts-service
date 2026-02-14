@@ -26,7 +26,29 @@ app = FastAPI(title="Piper TTS Service", version="1.0.0")
 voice_model: Optional[PiperVoice] = None
 MODEL_PATH = "/app/models/en_US-amy-medium.onnx"
 
+async def health_check(request):
+    """Health check для Uptime Robot и Render"""
+    return web.Response(text="Bot is alive!", status=200)
 
+
+async def start_web_server():
+    """Запуск фонового веб-сервера"""
+    try:
+        app = web.Application()
+        app.router.add_get('/', health_check)
+        app.router.add_get('/health', health_check)
+        app.router.add_get('/ping', health_check)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        
+        port = int(os.environ.get("PORT", 8080))
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        logger.info(f"✅ WEB SERVER STARTED ON PORT {port}")
+    except Exception as e:
+        logger.error(f"❌ Error starting web server: {e}")
+        
 @app.on_event("startup")
 async def load_model():
     """Загружаем модель при старте сервиса"""
