@@ -2,6 +2,7 @@ import os
 import io
 import re
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -15,23 +16,21 @@ import wave
 try:
     from piper import PiperVoice
 except ImportError:
-    # Fallback для локальной разработки
     PiperVoice = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Piper TTS Service", version="1.0.0")
-
-# Глобальная переменная для модели (загружаем один раз)
+# Глобальная переменная для модели
 voice_model: Optional[PiperVoice] = None
 MODEL_PATH = "/app/models/en_US-amy-medium.onnx"
 
 
-@app.on_event("startup")
-async def load_model():
-    """Загружаем модель при старте сервиса"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan контекст для загрузки/выгрузки модели"""
     global voice_model
+    # STARTUP: загружаем модель
     try:
         if PiperVoice and Path(MODEL_PATH).exists():
             logger.info(f"Loading Piper model from {MODEL_PATH}...")
@@ -41,16 +40,31 @@ async def load_model():
             logger.warning("⚠️ Piper model not found or library not installed")
     except Exception as e:
         logger.error(f"❌ Failed to load Piper model: {e}")
+    
+    yield  # Здесь работает приложение
+    
+    # SHUTDOWN: выгружаем модель (освобождаем ресурсы)
+    global voice_model
+    voice_model = None
+    logger.info("🛑 Piper model unloaded")
+
+
+# Создаём FastAPI приложение с lifespan
+app = FastAPI(
+    title="Piper TTS Service", 
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 
 class TTSRequest(BaseModel):
     text: str
-    voice: Optional[str] = "amy"  # Для совместимости с интерфейсом
+    voice: Optional[str] = "amy"
     speed: Optional[float] = 1.0
 
 
 # =============================================================================
-# ENDPOINTS ДЛЯ UPTIMEROBOT И МОНИТОРИНГА
+# ENDPOINTS ДЛЯ UPTIMEROBOT
 # =============================================================================
 
 @app.get("/")
@@ -71,7 +85,7 @@ async def health_check():
         "status": "healthy" if voice_model else "unhealthy",
         "model_loaded": voice_model is not None,
         "model_path": MODEL_PATH,
-        "uptime": True,
+        "model_exists": Path(MODEL_PATH).exists() if MODEL_PATH else False,
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -103,24 +117,17 @@ async def status():
 
 
 # =============================================================================
-# TTS ENDPOINTS
+# TTS ENDPOINTS (ваш существующий код)
 # =============================================================================
 
 @app.post("/tts")
 async def text_to_speech(request: TTSRequest):
-    """
-    Генерация аудио из текста (потоковая)
-    
-    Применяется оптимизация:
-    1. Разбиваем текст на предложения
-    2. Генерируем каждое предложение отдельно
-    3. Склеиваем в один WAV файл
-    """
+    """Генерация аудио из текста"""
     if not voice_model:
         raise HTTPException(status_code=503, detail="TTS model not loaded")
     
     try:
-        # Разбиваем текст на предложения для потоковой генерации
+        # Разбиваем текст на предложения
         sentences = split_into_sentences(request.text)
         
         # Генерируем аудио для каждого предложения
@@ -129,24 +136,19 @@ async def text_to_speech(request: TTSRequest):
         for sentence in sentences:
             if sentence.strip():
                 logger.info(f"Generating audio for: {sentence[:50]}...")
-                
-                # Генерируем аудио
                 audio_bytes = io.BytesIO()
                 voice_model.synthesize(sentence, audio_bytes)
                 audio_chunks.append(audio_bytes.getvalue())
         
-        # Объединяем все чанки в один WAV
+        # Объединяем все чанки
         combined_audio = combine_wav_chunks(audio_chunks)
         
         logger.info(f"✅ Generated {len(combined_audio)} bytes of audio")
         
-        # Возвращаем как WAV файл
         return Response(
             content=combined_audio,
             media_type="audio/wav",
-            headers={
-                "Content-Disposition": "attachment; filename=speech.wav"
-            }
+            headers={"Content-Disposition": "attachment; filename=speech.wav"}
         )
         
     except Exception as e:
@@ -156,16 +158,12 @@ async def text_to_speech(request: TTSRequest):
 
 @app.post("/tts/stream")
 async def text_to_speech_stream(request: TTSRequest):
-    """
-    Потоковая генерация аудио (для WebSocket в будущем)
-    Пока просто возвращаем по предложениям
-    """
+    """Потоковая генерация аудио"""
     if not voice_model:
         raise HTTPException(status_code=503, detail="TTS model not loaded")
     
     async def generate():
         sentences = split_into_sentences(request.text)
-        
         for sentence in sentences:
             if sentence.strip():
                 audio_bytes = io.BytesIO()
@@ -180,36 +178,27 @@ async def text_to_speech_stream(request: TTSRequest):
 # =============================================================================
 
 def split_into_sentences(text: str) -> list[str]:
-    """
-    Разбивает текст на предложения для потоковой генерации
-    Оптимизация из статьи: генерируем по предложениям
-    """
-    # Разбиваем по точкам, вопросам, восклицаниям
+    """Разбивает текст на предложения"""
     sentences = re.split(r'(?<=[.!?])\s+', text)
     return [s.strip() for s in sentences if s.strip()]
 
 
 def combine_wav_chunks(chunks: list[bytes]) -> bytes:
-    """
-    Объединяет несколько WAV чанков в один файл
-    """
+    """Объединяет несколько WAV чанков в один файл"""
     if not chunks:
         return b""
     
     if len(chunks) == 1:
         return chunks[0]
     
-    # Читаем параметры из первого чанка
     first_chunk = io.BytesIO(chunks[0])
     with wave.open(first_chunk, 'rb') as first_wav:
         params = first_wav.getparams()
         
-        # Создаём выходной файл
         output = io.BytesIO()
         with wave.open(output, 'wb') as out_wav:
             out_wav.setparams(params)
             
-            # Записываем аудио из всех чанков
             for chunk in chunks:
                 chunk_io = io.BytesIO(chunk)
                 with wave.open(chunk_io, 'rb') as chunk_wav:
@@ -219,11 +208,28 @@ def combine_wav_chunks(chunks: list[bytes]) -> bytes:
 
 
 # =============================================================================
-# MAIN
+# MAIN - САМОЕ ВАЖНОЕ ДЛЯ RENDER
 # =============================================================================
 
 if __name__ == "__main__":
     import uvicorn
+    
+    # БЕРЁМ ПОРТ ИЗ ПЕРЕМЕННОЙ ОКРУЖЕНИЯ
+    # Render сам подставит сюда нужное значение (обычно 10000 или 8080)
     port = int(os.environ.get("PORT", 8000))
-    logger.info(f"🚀 Starting Piper TTS Service on port {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    
+    # Логируем для отладки
+    logger.info("=" * 50)
+    logger.info(f"🚀 Starting Piper TTS Service")
+    logger.info(f"📌 PORT from env: {os.environ.get('PORT', 'not set')}")
+    logger.info(f"🔌 Binding to port: {port}")
+    logger.info(f"🌐 Health check URL: http://0.0.0.0:{port}/health")
+    logger.info("=" * 50)
+    
+    # Запускаем сервер
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        log_level="info"
+    )
