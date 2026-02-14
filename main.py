@@ -1,7 +1,10 @@
 import os
 import io
 import re
+import sys
+import signal
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -18,18 +21,48 @@ try:
 except ImportError:
     PiperVoice = None
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
+    force=True
+)
 logger = logging.getLogger(__name__)
 
-# Глобальная переменная для модели
+# Глобальные переменные
 voice_model: Optional[PiperVoice] = None
 MODEL_PATH = "/app/models/en_US-amy-medium.onnx"
+shutdown_event = asyncio.Event()
 
+
+# ============================================================================
+# ОБРАБОТКА СИГНАЛОВ (SIGTERM)
+# ============================================================================
+
+def handle_sigterm(signum, frame):
+    """Обработчик сигнала SIGTERM от Render"""
+    logger.info("📡 Received SIGTERM signal, initiating graceful shutdown...")
+    asyncio.create_task(trigger_shutdown())
+
+
+async def trigger_shutdown():
+    """Триггер для graceful shutdown"""
+    shutdown_event.set()
+
+
+# ============================================================================
+# LIFESPAN
+# ============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan контекст для загрузки/выгрузки модели"""
     global voice_model
+    
+    # Регистрируем обработчик SIGTERM
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    logger.info("✅ SIGTERM handler registered")
+    
     # STARTUP: загружаем модель
     try:
         if PiperVoice and Path(MODEL_PATH).exists():
@@ -43,10 +76,13 @@ async def lifespan(app: FastAPI):
     
     yield  # Здесь работает приложение
     
-    # SHUTDOWN: выгружаем модель (освобождаем ресурсы)
-    global voice_model
+    # SHUTDOWN: ждём сигнал и выгружаем модель
+    logger.info("🛑 Waiting for shutdown signal...")
+    await shutdown_event.wait()
+    
+    logger.info("🛑 Unloading Piper model...")
     voice_model = None
-    logger.info("🛑 Piper model unloaded")
+    logger.info("✅ Piper model unloaded")
 
 
 # Создаём FastAPI приложение с lifespan
@@ -117,7 +153,7 @@ async def status():
 
 
 # =============================================================================
-# TTS ENDPOINTS (ваш существующий код)
+# TTS ENDPOINTS
 # =============================================================================
 
 @app.post("/tts")
@@ -127,10 +163,7 @@ async def text_to_speech(request: TTSRequest):
         raise HTTPException(status_code=503, detail="TTS model not loaded")
     
     try:
-        # Разбиваем текст на предложения
         sentences = split_into_sentences(request.text)
-        
-        # Генерируем аудио для каждого предложения
         audio_chunks = []
         
         for sentence in sentences:
@@ -140,7 +173,6 @@ async def text_to_speech(request: TTSRequest):
                 voice_model.synthesize(sentence, audio_bytes)
                 audio_chunks.append(audio_bytes.getvalue())
         
-        # Объединяем все чанки
         combined_audio = combine_wav_chunks(audio_chunks)
         
         logger.info(f"✅ Generated {len(combined_audio)} bytes of audio")
@@ -208,25 +240,21 @@ def combine_wav_chunks(chunks: list[bytes]) -> bytes:
 
 
 # =============================================================================
-# MAIN - САМОЕ ВАЖНОЕ ДЛЯ RENDER
+# MAIN
 # =============================================================================
 
 if __name__ == "__main__":
     import uvicorn
     
-    # БЕРЁМ ПОРТ ИЗ ПЕРЕМЕННОЙ ОКРУЖЕНИЯ
-    # Render сам подставит сюда нужное значение (обычно 10000 или 8080)
+    # Берём порт из переменной окружения
     port = int(os.environ.get("PORT", 8000))
     
-    # Логируем для отладки
     logger.info("=" * 50)
     logger.info(f"🚀 Starting Piper TTS Service")
     logger.info(f"📌 PORT from env: {os.environ.get('PORT', 'not set')}")
     logger.info(f"🔌 Binding to port: {port}")
-    logger.info(f"🌐 Health check URL: http://0.0.0.0:{port}/health")
     logger.info("=" * 50)
     
-    # Запускаем сервер
     uvicorn.run(
         app, 
         host="0.0.0.0", 
