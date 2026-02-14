@@ -4,6 +4,7 @@ import re
 import logging
 from pathlib import Path
 from typing import Optional
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, Response
@@ -26,29 +27,7 @@ app = FastAPI(title="Piper TTS Service", version="1.0.0")
 voice_model: Optional[PiperVoice] = None
 MODEL_PATH = "/app/models/en_US-amy-medium.onnx"
 
-async def health_check(request):
-    """Health check для Uptime Robot и Render"""
-    return web.Response(text="Bot is alive!", status=200)
 
-
-async def start_web_server():
-    """Запуск фонового веб-сервера"""
-    try:
-        app = web.Application()
-        app.router.add_get('/', health_check)
-        app.router.add_get('/health', health_check)
-        app.router.add_get('/ping', health_check)
-        
-        runner = web.AppRunner(app)
-        await runner.setup()
-        
-        port = int(os.environ.get("PORT", 8080))
-        site = web.TCPSite(runner, '0.0.0.0', port)
-        await site.start()
-        logger.info(f"✅ WEB SERVER STARTED ON PORT {port}")
-    except Exception as e:
-        logger.error(f"❌ Error starting web server: {e}")
-        
 @app.on_event("startup")
 async def load_model():
     """Загружаем модель при старте сервиса"""
@@ -70,25 +49,62 @@ class TTSRequest(BaseModel):
     speed: Optional[float] = 1.0
 
 
+# =============================================================================
+# ENDPOINTS ДЛЯ UPTIMEROBOT И МОНИТОРИНГА
+# =============================================================================
+
 @app.get("/")
 async def root():
-    """Health check endpoint"""
+    """Health check endpoint для UptimeRobot"""
     return {
         "service": "Piper TTS Service",
         "status": "healthy" if voice_model else "model_not_loaded",
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat()
     }
 
 
 @app.get("/health")
 async def health_check():
-    """Детальный health check"""
+    """Детальный health check для мониторинга"""
     return {
         "status": "healthy" if voice_model else "unhealthy",
         "model_loaded": voice_model is not None,
-        "model_path": MODEL_PATH
+        "model_path": MODEL_PATH,
+        "uptime": True,
+        "timestamp": datetime.utcnow().isoformat()
     }
 
+
+@app.get("/ping")
+async def ping():
+    """Быстрый ping endpoint для UptimeRobot"""
+    return {
+        "pong": True,
+        "service": "piper-tts",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@app.get("/status")
+async def status():
+    """Подробный статус сервиса"""
+    return {
+        "service": "Piper TTS Service",
+        "version": "1.0.0",
+        "model": {
+            "loaded": voice_model is not None,
+            "path": MODEL_PATH,
+            "exists": Path(MODEL_PATH).exists() if MODEL_PATH else False
+        },
+        "piper_available": PiperVoice is not None,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+# =============================================================================
+# TTS ENDPOINTS
+# =============================================================================
 
 @app.post("/tts")
 async def text_to_speech(request: TTSRequest):
@@ -138,6 +154,31 @@ async def text_to_speech(request: TTSRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/tts/stream")
+async def text_to_speech_stream(request: TTSRequest):
+    """
+    Потоковая генерация аудио (для WebSocket в будущем)
+    Пока просто возвращаем по предложениям
+    """
+    if not voice_model:
+        raise HTTPException(status_code=503, detail="TTS model not loaded")
+    
+    async def generate():
+        sentences = split_into_sentences(request.text)
+        
+        for sentence in sentences:
+            if sentence.strip():
+                audio_bytes = io.BytesIO()
+                voice_model.synthesize(sentence, audio_bytes)
+                yield audio_bytes.getvalue()
+    
+    return StreamingResponse(generate(), media_type="audio/wav")
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
 def split_into_sentences(text: str) -> list[str]:
     """
     Разбивает текст на предложения для потоковой генерации
@@ -177,27 +218,12 @@ def combine_wav_chunks(chunks: list[bytes]) -> bytes:
         return output.getvalue()
 
 
-@app.post("/tts/stream")
-async def text_to_speech_stream(request: TTSRequest):
-    """
-    Потоковая генерация аудио (для WebSocket в будущем)
-    Пока просто возвращаем по предложениям
-    """
-    if not voice_model:
-        raise HTTPException(status_code=503, detail="TTS model not loaded")
-    
-    async def generate():
-        sentences = split_into_sentences(request.text)
-        
-        for sentence in sentences:
-            if sentence.strip():
-                audio_bytes = io.BytesIO()
-                voice_model.synthesize(sentence, audio_bytes)
-                yield audio_bytes.getvalue()
-    
-    return StreamingResponse(generate(), media_type="audio/wav")
-
+# =============================================================================
+# MAIN
+# =============================================================================
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    logger.info(f"🚀 Starting Piper TTS Service on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
